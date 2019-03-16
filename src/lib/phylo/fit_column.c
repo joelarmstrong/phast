@@ -29,6 +29,22 @@
 /* number of significant figures to which to estimate column scale
    parameters (currently affects 1d parameter estimation only) */
 
+/* code to compute the sum of probabilities in log space, thanks to
+ * Kevin Karplus. Adapted to handle -INF (i.e. 0 probability) properly */
+double log1pexp(double x)
+{
+    return x<-709.089565713? 0.: log1p(exp(x));
+}
+double sum_log_prob(double a, double b)
+{
+    if (a == -INFINITY) {
+        return b;
+    } else if (b == -INFINITY) {
+        return a;
+    }
+    return a>b? a+log1pexp(b-a):  b+log1pexp(a-b);
+}
+
 /* Compute and return the log likelihood of a tree model with respect
    to a single column tuple in an alignment.  This is a pared-down
    version of tl_compute_log_likelihood for use in estimation of
@@ -120,7 +136,79 @@ double col_compute_likelihood(TreeModel *mod, MSA *msa, int tupleidx,
  */
 double col_compute_log_likelihood(TreeModel *mod, MSA *msa, int tupleidx,
                                   double **scratch) {
-  return log(col_compute_likelihood(mod, msa, tupleidx, scratch));
+  int i, j, k, nodeidx, rcat;
+  int nstates = mod->rate_matrix->size;
+  TreeNode *n;
+  double total_prob = log(0);
+  List *traversal = tr_postorder(mod->tree);
+  double **pL = NULL;
+
+  if (msa->ss->tuple_size != 1)
+    die("ERROR col_compute_likelihood: need tuple size 1, got %i\n",
+	msa->ss->tuple_size);
+  if (mod->order != 0)
+    die("ERROR col_compute_likelihood: got mod->order of %i, expected 0\n",
+	mod->order);
+  if (!mod->allow_gaps)
+    die("ERROR col_compute_likelihood: need mod->allow_gaps to be TRUE\n");
+
+  /* allocate memory or use scratch if avail */
+  if (scratch != NULL)
+    pL = scratch;
+  else {
+    pL = smalloc(nstates * sizeof(double*));
+    for (j = 0; j < nstates; j++)
+      pL[j] = smalloc((mod->tree->nnodes+1) * sizeof(double));
+  }
+
+  for (rcat = 0; rcat < mod->nratecats; rcat++) {
+    for (nodeidx = 0; nodeidx < lst_size(traversal); nodeidx++) {
+      n = lst_get_ptr(traversal, nodeidx);
+      if (n->lchild == NULL) {
+        /* leaf: base case of recursion */
+        int state = mod->rate_matrix->
+          inv_states[(int)ss_get_char_tuple(msa, tupleidx,
+                                            mod->msa_seq_idx[n->id], 0)];
+        for (i = 0; i < nstates; i++) {
+          if (state < 0 || i == state)
+            pL[i][n->id] = log(1);
+          else
+            pL[i][n->id] = log(0);
+        }
+      }
+      else {
+        /* general recursive case */
+        MarkovMatrix *lsubst_mat = mod->P[n->lchild->id][rcat];
+        MarkovMatrix *rsubst_mat = mod->P[n->rchild->id][rcat];
+        for (i = 0; i < nstates; i++) {
+          double totl = log(0), totr = log(0);
+          for (j = 0; j < nstates; j++) {
+              printf("totl: %lf\n", totl);
+            totl = sum_log_prob(totl, pL[j][n->lchild->id] +
+                                log(mm_get(lsubst_mat, i, j)));
+          }
+
+          for (k = 0; k < nstates; k++)
+            totr = sum_log_prob(totr, pL[k][n->rchild->id] +
+                                log(mm_get(rsubst_mat, i, k)));
+
+          pL[i][n->id] = totl + totr;
+        }
+      }
+    }
+
+    /* termination (for each rate cat) */
+    for (i = 0; i < nstates; i++)
+      total_prob = sum_log_prob(total_prob, log(vec_get(mod->backgd_freqs, i)) + 
+                                pL[i][mod->tree->id] + log(mod->freqK[rcat]));
+  }
+
+  if (scratch == NULL) {
+    for (j = 0; j < nstates; j++) sfree(pL[j]);
+    sfree(pL);
+  }
+
+  return(total_prob);
 }
 
 
